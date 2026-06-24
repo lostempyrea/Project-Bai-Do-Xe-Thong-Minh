@@ -1,0 +1,402 @@
+// --- KHAI BÁO CÁC THƯ VIỆN CẦN THIẾT ---
+#include <Wire.h>               // Thư viện giao tiếp I2C
+#include <RTClib.h>             // Thư viện xử lý thời gian thực
+#include <SPI.h>                // Thư viện giao tiếp chuẩn SPI
+#include <MFRC522.h>            // Thư viện điều khiển module RFID RC522
+#include <LiquidCrystal_I2C.h>  // Thư viện điều khiển màn hình LCD I2C
+#include <Servo.h>              // Thư viện điều khiển động cơ Servo
+#include <EEPROM.h>             // Thư viện đọc/ghi bộ nhớ EEPROM
+
+// ==========================================================================================
+//  PHẦN 1: CẤU HÌNH HỆ THỐNG VÀ ĐỊNH NGHĨA CHÂN KẾT NỐI
+// ==========================================================================================
+
+// --- Cấu hình tham số hệ thống ---
+#define MASTER_UID        0x4B9C0705  // Mã UID của thẻ Admin
+#define EEPROM_SIGNATURE  0xC0DE      // Chữ ký kiểm tra bộ nhớ
+
+const int MAX_CARS            = 3;    // Tổng số chỗ đỗ xe tối đa của bãi
+const int MAX_VIP_SIZE        = 0;    // Không sử dụng VIP
+const long FEE_PER_UNIT       = 3000; // Đơn giá gửi xe (3000 VNĐ cho mỗi phút)
+const unsigned long BARRIER_DELAY = 5000; // Thời gian giữ barrier mở (5000ms = 5 giây)
+
+// --- Định nghĩa chân kết nối (Pin Mapping) ---
+#define PIN_RFID_SS       10          // Chân SS (SDA) của module RFID
+#define PIN_RFID_RST      9           // Chân RST của module RFID
+#define PIN_SERVO         8           // Chân tín hiệu điều khiển Servo
+#define PIN_LED_GREEN     7           // Chân đèn LED Xanh
+#define PIN_LED_RED       6           // Chân đèn LED Đỏ
+#define PIN_BUZZER        5           // Chân còi chip (Buzzer)
+#define PIN_FLAME         4           // Chân cảm biến lửa (Báo cháy)
+#define PIN_MQ2           3           // Chân cảm biến khí Gas/Khói
+#define PIN_RESET_BTN     A0          // Chân nút nhấn cứng (Reset dữ liệu gốc)
+
+#define CLOSE_ANGLE_SERVO 90          // Góc đóng của servo
+#define OPEN_ANGLE_SERVO  0           // Góc mở của servo
+
+// --- Khởi tạo các đối tượng điều khiển ---
+RTC_DS1307 rtc;
+MFRC522 mfrc522(PIN_RFID_SS, PIN_RFID_RST);
+LiquidCrystal_I2C lcd(0x27, 16, 2);   
+Servo barrierServo;
+
+// ==========================================================================================
+//  PHẦN 2: BIẾN TOÀN CỤC (LƯU TRỮ TRẠNG THÁI HỆ THỐNG)
+// ==========================================================================================
+
+uint32_t parkedUIDs[MAX_CARS];        // Mảng lưu UID của các xe đang gửi
+uint32_t parkedTimestamps[MAX_CARS];  // Mảng lưu thời gian (Unix time) lúc xe vào
+int parkedCount = 0;                  // Biến đếm tổng số xe đang có trong bãi
+int vipParkedCount = 0;               // Biến đếm số lượng xe VIP đang gửi
+
+uint32_t vipList[MAX_VIP_SIZE];       // Mảng danh sách các thẻ VIP đã đăng ký
+int currentVipCount = 0;              // Số lượng thẻ VIP hiện có
+
+bool isGasWarningActive = false;      // Cờ báo hiệu trạng thái cảnh báo khí Gas
+
+// ==========================================================================================
+//  PHẦN 3: CÁC HÀM HỖ TRỢ HIỂN THỊ VÀ ĐIỀU KHIỂN CƠ BẢN
+// ==========================================================================================
+
+void printTwoDigits(int number) {
+    if (number < 10) {
+        lcd.print("0");
+    }
+    lcd.print(number);
+}
+
+void showMessage(const char* line1, const char* line2, int delayMs) {
+    lcd.clear();
+    lcd.setCursor(0, 0); 
+    lcd.print(line1);
+    
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+    
+    if (delayMs > 0) {
+        delay(delayMs);
+    }
+}
+
+void beep(int times) {
+    for (int i = 0; i < times; i++) {
+        digitalWrite(PIN_BUZZER, HIGH);
+        delay(100);
+        digitalWrite(PIN_BUZZER, LOW);  
+        delay(100);
+    }
+}
+
+void controlBarrier(bool success) {
+    if (success) {
+        digitalWrite(PIN_LED_GREEN, HIGH);
+        digitalWrite(PIN_LED_RED, LOW);
+        
+        barrierServo.attach(PIN_SERVO);
+        barrierServo.write(OPEN_ANGLE_SERVO);
+        delay(BARRIER_DELAY);
+        barrierServo.write(CLOSE_ANGLE_SERVO);
+        delay(500);
+        barrierServo.detach();
+        
+        digitalWrite(PIN_LED_GREEN, LOW);
+    } else {
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(PIN_LED_RED, HIGH);
+            beep(1); 
+            digitalWrite(PIN_LED_RED, LOW); 
+            delay(100);
+        }
+    }
+}
+
+void updateIdleScreen() {
+    lcd.clear();
+    lcd.setCursor(3, 0); 
+    lcd.print("BAI DAU XE");
+    
+    lcd.setCursor(0, 1); 
+    lcd.print("SLOT : ");
+    lcd.print(parkedCount);
+    lcd.print("/");
+    lcd.print(MAX_CARS);
+}
+
+// ==========================================================================================
+//  PHẦN 4: QUẢN LÝ BỘ NHỚ EEPROM
+// ==========================================================================================
+
+void saveData() {
+    int addr = 0;
+    EEPROM.put(addr, EEPROM_SIGNATURE);   addr += sizeof(int);
+    EEPROM.put(addr, parkedCount);        addr += sizeof(int);
+    EEPROM.put(addr, vipParkedCount);     addr += sizeof(int);
+    EEPROM.put(addr, parkedUIDs);         addr += sizeof(parkedUIDs);
+    EEPROM.put(addr, parkedTimestamps);   addr += sizeof(parkedTimestamps);
+    EEPROM.put(addr, currentVipCount);    addr += sizeof(int);
+    EEPROM.put(addr, vipList);
+}
+
+void loadData() {
+    int addr = 0, signature;
+    EEPROM.get(addr, signature); 
+    addr += sizeof(int);
+    
+    if (signature != EEPROM_SIGNATURE) {
+        parkedCount = 0;
+        vipParkedCount = 0; 
+        currentVipCount = 0;
+        memset(parkedUIDs, 0, sizeof(parkedUIDs));
+        memset(parkedTimestamps, 0, sizeof(parkedTimestamps));
+        memset(vipList, 0, sizeof(vipList));
+        saveData();
+    } else {
+        EEPROM.get(addr, parkedCount);        addr += sizeof(int);
+        EEPROM.get(addr, vipParkedCount);     addr += sizeof(int);
+        EEPROM.get(addr, parkedUIDs);         addr += sizeof(parkedUIDs);
+        EEPROM.get(addr, parkedTimestamps);   addr += sizeof(parkedTimestamps);
+        EEPROM.get(addr, currentVipCount);    addr += sizeof(int);
+        EEPROM.get(addr, vipList);
+        
+        if (currentVipCount < 0 || currentVipCount > MAX_VIP_SIZE || currentVipCount > MAX_CARS) {
+            currentVipCount = 0;
+            memset(vipList, 0, sizeof(vipList));
+        }
+    }
+}
+
+// ==========================================================================================
+//  PHẦN 5: LOGIC NGHIỆP VỤ & QUẢN TRỊ
+// ==========================================================================================
+
+bool isVipCard(uint32_t uid) {
+    if (uid == MASTER_UID) return true;
+    for (int i = 0; i < MAX_VIP_SIZE; i++) {
+        if (vipList[i] == uid) return true;
+    }
+    return false;
+}
+
+int checkVipAddStatus() {
+    if (currentVipCount >= MAX_VIP_SIZE) return 1;
+    if ((parkedCount - vipParkedCount) + (currentVipCount + 1) > MAX_CARS) return 2;
+    return 0;
+}
+
+bool isCarCurrentlyParked(uint32_t checkUID) {
+    for (int i = 0; i < MAX_CARS; i++) {
+        if (parkedUIDs[i] != 0 && parkedUIDs[i] == checkUID) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void tryAddVip(uint32_t newUID) {
+    if (isCarCurrentlyParked(newUID)) {
+        showMessage("LOI: XE DANG GUI", "RA KHOI BAI TRUOC", 0);
+        beep(3);
+        return;
+    }
+
+    int status = checkVipAddStatus();
+    if (status == 0) {
+        vipList[currentVipCount] = newUID;
+        currentVipCount++;
+        saveData();
+        
+        digitalWrite(PIN_LED_GREEN, HIGH); 
+        beep(1);
+        showMessage("DA THEM VIP", "THANH CONG", 1000); 
+        digitalWrite(PIN_LED_GREEN, LOW);  
+    } else {
+        if (status == 1) {
+            showMessage("LOI: BO NHO FULL", "GIOI HAN VIP!", 0);
+        } else if (status == 2) {
+            showMessage("LOI: KHONG THEM", "XE THUONG CHIEM!", 0);
+        }
+        beep(3);
+    }
+}
+
+void tryRemoveVip(int indexToRemove, uint32_t uidToRemove) {
+    if (isCarCurrentlyParked(uidToRemove)) {
+        showMessage("LOI: XE DANG GUI", "RA KHOI BAI TRUOC", 2000);
+        beep(3);
+        return;
+    }
+
+    vipList[indexToRemove] = 0;
+    for (int j = indexToRemove; j < MAX_VIP_SIZE - 1; j++) {
+        vipList[j] = vipList[j+1];
+    }
+    vipList[MAX_VIP_SIZE - 1] = 0;
+    currentVipCount--;
+    
+    saveData(); 
+    
+    digitalWrite(PIN_LED_RED, HIGH);
+    beep(1); 
+    showMessage("DA XOA VIP", "THANH CONG", 1000);
+    digitalWrite(PIN_LED_RED, LOW);   
+}
+
+void handleMasterMode() {
+    showMessage("ADMIN MODE", "NUT: RESET ALL", 0);
+    beep(3);
+
+    while (true) {
+        if (digitalRead(PIN_RESET_BTN) == LOW) {
+            delay(50);
+            if (digitalRead(PIN_RESET_BTN) == LOW) {
+                showMessage("DANG RESET...", " ", 1000);
+                
+                parkedCount = 0;
+                vipParkedCount = 0; 
+                currentVipCount = 0;
+                memset(parkedUIDs, 0, sizeof(parkedUIDs));
+                memset(parkedTimestamps, 0, sizeof(parkedTimestamps));
+                memset(vipList, 0, sizeof(vipList));
+                saveData();
+                
+                showMessage("DA XOA DU LIEU", "HE THONG SACH SE", 1000);
+                while(digitalRead(PIN_RESET_BTN) == LOW); 
+                return;
+            }
+        }
+
+        if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+            uint32_t newUID = 0;
+            for (byte i = 0; i < 4; i++) {
+                newUID = (newUID << 8) | mfrc522.uid.uidByte[i];
+            }
+            mfrc522.PICC_HaltA(); 
+            mfrc522.PCD_StopCrypto1();
+
+            if (newUID == MASTER_UID) {
+                showMessage("ADMIN MODE", "KET THUC!", 0);
+                digitalWrite(PIN_LED_RED, HIGH); 
+                beep(3); 
+                digitalWrite(PIN_LED_RED, LOW);  
+                return; 
+            }
+
+            int foundIndex = -1;
+            for (int i = 0; i < MAX_VIP_SIZE; i++) {
+                if (vipList[i] == newUID) { 
+                    foundIndex = i;
+                    break; 
+                }
+            }
+
+            if (foundIndex != -1) { 
+                tryRemoveVip(foundIndex, newUID);
+            } else { 
+                tryAddVip(newUID);
+            }
+            showMessage("ADMIN MODE", "NUT: RESET ALL", 0);
+        }
+    }
+}
+
+// ==========================================================================================
+//  PHẦN 6: AN TOÀN CHÁY NỔ & QUY TRÌNH ĐỖ XE
+// ==========================================================================================
+
+void checkFireSafety() {
+    if (digitalRead(PIN_FLAME) == LOW) { 
+        barrierServo.attach(PIN_SERVO);
+        barrierServo.write(OPEN_ANGLE_SERVO);
+
+        while (digitalRead(PIN_FLAME) == LOW) {
+            lcd.clear();
+            lcd.setCursor(0, 0); 
+            lcd.print("!!! CHAY !!!");
+            lcd.setCursor(0, 1); 
+            lcd.print("DANG MO CONG...");
+            
+            digitalWrite(PIN_BUZZER, HIGH); 
+            digitalWrite(PIN_LED_RED, HIGH);
+            delay(50);
+            digitalWrite(PIN_BUZZER, LOW); 
+            digitalWrite(PIN_LED_RED, LOW);
+            delay(50);
+        }
+
+        delay(1000); 
+        barrierServo.write(CLOSE_ANGLE_SERVO); 
+        delay(500); 
+        barrierServo.detach();
+        
+        isGasWarningActive = false;
+        updateIdleScreen();
+    }
+    else if (digitalRead(PIN_MQ2) == LOW) {
+        isGasWarningActive = true;
+        lcd.clear();
+        lcd.setCursor(0, 0); 
+        lcd.print("! CANH BAO GAS !");
+        lcd.setCursor(0, 1); 
+        lcd.print("NGUY HIEM !!!");
+        
+        digitalWrite(PIN_BUZZER, HIGH);
+        digitalWrite(PIN_LED_RED, HIGH);
+        delay(50);
+        digitalWrite(PIN_BUZZER, LOW);
+        digitalWrite(PIN_LED_RED, LOW);
+        delay(50);
+    }
+    else {
+        if (isGasWarningActive) { 
+            isGasWarningActive = false;
+            updateIdleScreen();
+        }
+    }
+}
+
+uint32_t getRFID() {
+    if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+        return 0;
+    }
+    
+    uint32_t uid = 0;
+    for (byte i = 0; i < 4; i++) {
+        uid = (uid << 8) | mfrc522.uid.uidByte[i];
+    }
+    
+    mfrc522.PICC_HaltA(); 
+    mfrc522.PCD_StopCrypto1();
+    return uid;
+}
+
+void handleParking(uint32_t rfid) {
+    beep(1);
+    
+    if (rfid == MASTER_UID) {
+        handleMasterMode();
+        updateIdleScreen(); 
+        return;
+    }
+
+    DateTime now = rtc.now();
+    uint32_t currentUnix = now.unixtime();
+    
+    int index = -1;
+    for (int i = 0; i < MAX_CARS; i++) {
+        if (parkedUIDs[i] == rfid) {
+            index = i;
+        }
+    }
+        
+    bool isVIP = isVipCard(rfid);
+
+    // --- TRƯỜNG HỢP XE VÀO ---
+    if (index == -1) { 
+        bool allowEntry = false;
+        
+        if (isVIP) {
+            if (parkedCount < MAX_CARS) {
+                allowEntry = true;
+            }
+        } else {
+            if ((parkedCount - vipParkedCount) < (MAX_CARS - currentVipCount) &&
